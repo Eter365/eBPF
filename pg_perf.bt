@@ -1,0 +1,50 @@
+/*
+ * pg_perf.bt - 基于 uprobe 的 PostgreSQL 性能追踪脚本 (ARM64 优化版)
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+// 1. 捕获 SQL 文本
+uprobe:/usr/local/pgsql/bin/postgres:exec_simple_query {
+    $sql = str(arg0);
+    @sql_text[tid] = $sql;
+    @start_time[tid] = nsecs;
+    
+    // 打印开始信息
+    printf("[%s] PID:%-6d TID:%-6d 收到 SQL: %s\n", 
+           strftime("%H:%M:%S", nsecs), pid, tid, $sql);
+}
+
+// 2. 统计执行耗时 (针对执行器阶段)
+uprobe:/usr/local/pgsql/bin/postgres:ExecutorRun {
+    @exec_start[tid] = nsecs;
+}
+
+uretprobe:/usr/local/pgsql/bin/postgres:ExecutorRun {
+    if (@exec_start[tid]) {
+        $duration = (nsecs - @exec_start[tid]) / 1000; // 微秒
+        @exec_lat_us[comm] = hist($duration);
+        delete(@exec_start[tid]);
+    }
+}
+
+// 3. 汇总并打印结果
+uretprobe:/usr/local/pgsql/bin/postgres:exec_simple_query {
+    if (@start_time[tid]) {
+        $now = nsecs;
+        $total_duration = ($now - @start_time[tid]) / 1000; // 微秒
+        
+        printf("[%s] PID:%-6d TID:%-6d 结束 | 耗时:%7d us | SQL:%s\n", 
+               strftime("%H:%M:%S", $now), pid, tid, $total_duration, @sql_text[tid]);
+        
+        delete(@start_time[tid]);
+        delete(@sql_text[tid]);
+    }
+}
+
+// 4. 退出时打印整体分布
+END {
+    printf("\n\n=== 整体执行器 (ExecutorRun) 耗时分布 (单位: 微秒) ===\n");
+}

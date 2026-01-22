@@ -1,0 +1,45 @@
+/*
+ * trace_vacuum_buffer.bt - 监控 VACUUM FULL 对缓存的冲击
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+BEGIN {
+    printf("监控启动... 正在观察 VACUUM FULL 导致的缓存淘汰情况\n");
+}
+
+// 1. 标记 VACUUM 进程
+uprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    @in_vacuum[tid] = 1;
+}
+
+// 2. 监控缓冲区分配
+uprobe:/usr/local/pgsql/bin/postgres:BufferAlloc {
+    if (@in_vacuum[tid]) {
+        @buffer_requests[pid] = count();
+    }
+}
+
+// 3. 监控缓冲区淘汰（关键：当一个 Buffer 必须被踢出时调用）
+uprobe:/usr/local/pgsql/bin/postgres:StrategyGetBuffer {
+    if (@in_vacuum[tid]) {
+        @buffer_evictions[pid] = count();
+        // 实时打印淘汰事件
+        printf("[%s] 警告: 缓存池已满，VACUUM 正在踢出旧数据页!\n", strftime("%H:%M:%S", nsecs));
+    }
+}
+
+// 4. 结束标记
+uretprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    delete(@in_vacuum[tid]);
+}
+
+END {
+    printf("\n=== 缓存冲击报告 ===\n");
+    printf("总请求 Buffer 次数:\n");
+    print(@buffer_requests);
+    printf("\n导致物理淘汰 (Eviction) 次数:\n");
+    print(@buffer_evictions);
+}

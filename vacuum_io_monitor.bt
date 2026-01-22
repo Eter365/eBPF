@@ -1,0 +1,71 @@
+/*
+ * vacuum_io_monitor.bt - 监控 VACUUM 导致的缓存剔除内存量及写入带宽
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+BEGIN {
+    printf("开始监控 VACUUM 产生的 IO 与缓存挤压... (Page Size: 8KB)\n");
+    printf("%-10s %-15s %-15s %-15s\n", "TIME", "EVICT_PAGES", "EVICT_MEM", "WRITE_BW");
+}
+
+// 1. 标记 VACUUM 进程
+uprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    @in_vacuum[tid] = 1;
+    @start_ts = nsecs;
+}
+
+// 2. 追踪缓冲区剔除 (StrategyGetBuffer 意味着一个页面被选中准备替换)
+uprobe:/usr/local/pgsql/bin/postgres:StrategyGetBuffer {
+    if (@in_vacuum[tid]) {
+        @evict_count[pid]++;
+        @total_evict_count++;
+    }
+}
+
+// 3. 追踪物理写入 (计算写入吞吐量)
+// arg2 是 mdwrite 写入的字节数
+uprobe:/usr/local/pgsql/bin/postgres:mdwrite {
+    if (@in_vacuum[tid]) {
+        $bytes = arg2;
+        @total_write_bytes += $bytes;
+        @period_write_bytes += $bytes;
+    }
+}
+
+// 4. 定时输出 (每秒输出一次带宽和内存剔除情况)
+interval:s:1 {
+    if (@total_evict_count > 0 || @total_write_bytes > 0) {
+        $pages = @total_evict_count;
+        $mem_kb = $pages * 8; // 8KB per page
+        $bw_kb = @period_write_bytes / 1024;
+        
+        printf("[%s] 剔除页数:%-8ld 释放内存:%-8ld KB 写入带宽:%-8ld KB/s\n", 
+               strftime("%H:%M:%S", nsecs), $pages, $mem_kb, $bw_kb);
+        
+        clear(@period_write_bytes); // 重置秒级带宽计算
+    }
+}
+
+// 5. 结束追踪
+uretprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    if (@in_vacuum[tid]) {
+        $duration_s = (nsecs - @start_ts) / 1000000000;
+        printf("\n--- VACUUM 任务结束 ---\n");
+        printf("总持续时间: %ld 秒\n", $duration_s);
+        printf("总剔除页面: %ld 页\n", (uint64)@total_evict_count);
+        printf("总释放内存: %ld MB\n", (uint64)(@total_evict_count * 8) / 1024);
+        printf("总写入数据: %ld MB\n", (uint64)@total_write_bytes / 1024 / 1024);
+        
+        delete(@in_vacuum[tid]);
+        clear(@total_evict_count);
+        clear(@total_write_bytes);
+    }
+}
+
+END {
+    clear(@in_vacuum);
+    clear(@evict_count);
+}

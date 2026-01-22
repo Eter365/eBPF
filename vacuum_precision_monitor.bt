@@ -1,0 +1,65 @@
+/*
+ * vacuum_io_ultimate.bt - 修复元组索引并增强 IO 捕获
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+BEGIN {
+    printf("正在深度监控 VACUUM 导致的缓存挤压与物理磁盘写入...\n");
+    printf("%-10s %-12s %-12s %-15s\n", "TIME", "EVICT_PAGES", "EVICT_MEM", "DISK_WRITE_BW");
+}
+
+// 1. 标记 VACUUM 进程
+uprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    @in_vacuum[pid] = 1;
+}
+
+// 2. 统计缓冲区剔除 (8KB/Page)
+uprobe:/usr/local/pgsql/bin/postgres:StrategyGetBuffer {
+    if (@in_vacuum[pid]) {
+        @evict_count[pid] = count();
+    }
+}
+
+// 3. 监控内核块设备层的写入请求 (args->nr_sector 是扇区数，1扇区=512字节)
+tracepoint:block:block_rq_insert {
+    if (@in_vacuum[pid]) {
+        $bytes = (uint64)args->nr_sector * 512;
+        @period_write_bytes += $bytes;
+        @total_write_bytes += $bytes;
+    }
+}
+
+// 4. 每秒计算并打印
+interval:s:1 {
+    $evict_pages = (uint64)0;
+    // $kv.0 是 PID (key), $kv.1 是 count (value)
+    for ($kv : @evict_count) {
+        $evict_pages = (uint64)$kv.1;
+    }
+
+    $mem_kb = $evict_pages * 8;
+    $bw_kb = @period_write_bytes / 1024;
+    
+    printf("[%s] 剔除页:%-8ld 释放:%-8ldKB 写入:%-8ldKB/s\n", 
+           strftime("%H:%M:%S", nsecs), $evict_pages, $mem_kb, $bw_kb);
+    
+    clear(@period_write_bytes);
+}
+
+// 5. 任务结束汇总
+uretprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    if (@in_vacuum[pid]) {
+        $p = pid;
+        $total_pages = (uint64)@evict_count[$p];
+        printf("\n--- VACUUM 任务汇总报告 (PID: %d) ---\n", $p);
+        printf("总剔除内存: %ld MB\n", ($total_pages * 8) / 1024);
+        printf("总写入磁盘: %ld MB\n", (uint64)@total_write_bytes / 1024 / 1024);
+        
+        delete(@in_vacuum[$p]);
+        delete(@evict_count[$p]);
+        clear(@total_write_bytes);
+    }
+}

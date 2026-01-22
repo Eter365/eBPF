@@ -1,0 +1,47 @@
+/*
+ * pg_buffer_check.bt - 修正后的命中率追踪
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+BEGIN {
+    printf("开始追踪... 正在监控 Shared Buffers 命中情况\n");
+}
+
+uprobe:/usr/local/pgsql/bin/postgres:ReadBuffer_common {
+    @hit_ptr[tid] = arg6;
+}
+
+uretprobe:/usr/local/pgsql/bin/postgres:ReadBuffer_common {
+    $ptr = @hit_ptr[tid];
+    if ($ptr != 0) {
+        $is_hit = * (uint8 *)$ptr; 
+        if ($is_hit == 1) {
+            @buffer_stats["Hit"] = count();
+        } else {
+            @buffer_stats["Miss"] = count();
+            // 记录缺失的具体进程
+            @miss_by_comm[comm] = count();
+        }
+    }
+    delete(@hit_ptr[tid]);
+}
+
+END {
+    // 强制转为无符号 64 位以消除警告
+    $hits = (uint64)@buffer_stats["Hit"];
+    $misses = (uint64)@buffer_stats["Miss"];
+    $total = $hits + $misses;
+
+    printf("\n\n=== 调优结果统计 ===\n");
+    if ($total > 0) {
+        $rate = ($hits * 100) / $total;
+        printf("总请求: %ld | 命中: %ld | 缺失: %ld\n", $total, $hits, $misses);
+        printf("当前 Shared Buffers 命中率: %ld%%\n", $rate);
+    }
+
+    printf("\n=== 导致磁盘读取最多的进程 (排名) ===\n");
+    print(@miss_by_comm);
+}

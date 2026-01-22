@@ -1,0 +1,41 @@
+/*
+ * pg_io_real.bt - 追踪真正的物理 IO 读取
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+// 1. 捕获 SQL
+uprobe:/usr/local/pgsql/bin/postgres:exec_simple_query {
+    @current_sql[tid] = str(arg0);
+    @query_start[tid] = nsecs;
+}
+
+// 2. 追踪物理磁盘读取 (mdread 是读文件的核心入口)
+uprobe:/usr/local/pgsql/bin/postgres:mdread {
+    $sql = @current_sql[tid];
+    @io_stats["Physical Read Count"] = count();
+    if ($sql != "") {
+        @io_by_sql[$sql] = count();
+        // 打印实时发生的 IO，排查是否挂载成功
+        printf("[%s] 物理读取发生! PID:%d | SQL:%s\n", strftime("%H:%M:%S", nsecs), pid, $sql);
+    }
+}
+
+// 3. 结束查询时打印单条耗时
+uretprobe:/usr/local/pgsql/bin/postgres:exec_simple_query {
+    if (@query_start[tid]) {
+        $lat = (nsecs - @query_start[tid]) / 1000;
+        // printf("Query Finished: %d us\n", $lat);
+        delete(@query_start[tid]);
+        delete(@current_sql[tid]);
+    }
+}
+
+END {
+    printf("\n=== 磁盘读取统计 ===\n");
+    print(@io_stats);
+    printf("\n=== 触发物理读的 SQL 排行榜 ===\n");
+    print(@io_by_sql);
+}

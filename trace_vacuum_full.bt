@@ -1,0 +1,58 @@
+/*
+ * trace_vacuum_full_v2.bt - 修正后的 VACUUM FULL 监控
+ */
+
+config = {
+    missing_probes = "ignore"
+}
+
+BEGIN {
+    printf("开始监控 VACUUM FULL... 请执行命令并观察输出\n");
+    printf("%-10s %-8s %-20s %-15s\n", "TIME", "PID", "STAGE", "DETAIL");
+}
+
+// 1. 监控入口 (cluster_rel 是 VACUUM FULL 的核心函数)
+uprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    @in_vacuum[tid] = 1;
+    @moved_tuples[tid] = 0; // 初始化计数器
+    printf("[%s] %-8d %-20s 开始扫描并重建表\n", 
+           strftime("%H:%M:%S", nsecs), pid, "START");
+}
+
+// 2. 核心操作：搬迁有效元组
+uprobe:/usr/local/pgsql/bin/postgres:RelationPutHeapTuple {
+    if (@in_vacuum[tid]) {
+        @moved_tuples[tid]++;
+        $count = (uint64)@moved_tuples[tid];
+        // 每 10000 行打印一次进度
+        if ($count % 10000 == 0) {
+            printf("[%s] %-8d %-20s 已搬迁 %ld 个元组\n", 
+                   strftime("%H:%M:%S", nsecs), pid, "PROGRESS", $count);
+        }
+    }
+}
+
+// 3. 监控物理 IO (写入新表的数据页)
+uprobe:/usr/local/pgsql/bin/postgres:mdwrite {
+    if (@in_vacuum[tid]) {
+        @io_writes[pid] = count();
+    }
+}
+
+// 4. 结束监控
+uretprobe:/usr/local/pgsql/bin/postgres:cluster_rel {
+    if (@in_vacuum[tid]) {
+        $total = (uint64)@moved_tuples[tid];
+        printf("[%s] %-8d %-20s 重建结束。总搬迁量: %ld\n", 
+               strftime("%H:%M:%S", nsecs), pid, "FINISH", $total);
+        delete(@in_vacuum[tid]);
+        delete(@moved_tuples[tid]);
+    }
+}
+
+END {
+    printf("\n=== 磁盘写入次数统计 (mdwrite) ===\n");
+    print(@io_writes);
+    clear(@in_vacuum);
+    clear(@moved_tuples);
+}
