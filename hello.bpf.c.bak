@@ -1,0 +1,49 @@
+#ifndef __TARGET_ARCH_arm64
+#define __TARGET_ARCH_arm64
+#endif
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+/* 手动定义 ARM64 寄存器结构 */
+struct user_pt_regs {
+    unsigned long regs[31];
+    unsigned long sp;
+    unsigned long pc;
+    unsigned long pstate;
+};
+
+char LICENSE[] SEC("license") = "GPL";
+
+SEC("uprobe//usr/local/pgsql/bin/postgres:exec_simple_query")
+int handle_pg_query(struct user_pt_regs *ctx)
+{
+    char comm[16];
+    char query_buf[128];
+    
+    // 获取 PID 和 TGID (内核中返回的是 64位值，高32位是 PID，低32位是 TID)
+    unsigned long long pid_tgid = bpf_get_current_pid_tgid();
+    unsigned int pid = pid_tgid >> 32;
+    unsigned int uid = bpf_get_current_uid_gid();
+
+    bpf_get_current_comm(&comm, sizeof(comm));
+
+    // ARM64: 第一个参数在 x0 (regs[0])
+    const char *query_string = (const char *)ctx->regs[0];
+
+    long res = bpf_probe_read_user_str(&query_buf, sizeof(query_buf), query_string);
+
+    if (res > 0) {
+        /* * 打印字段：
+         * PID: 进程 ID
+         * UID: 用户 ID
+         * COMM: 进程名
+         * SQL: 语句内容
+         */
+        bpf_printk("PG_TRACK [PID:%u] [UID:%u] [COMM:%s] SQL:%s\n", 
+                   pid, uid, comm, query_buf);
+    }
+
+    return 0;
+}

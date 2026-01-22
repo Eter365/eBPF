@@ -1,0 +1,39 @@
+/* pg_trace_final.bt */
+
+BEGIN {
+    printf("%-8s %-10s %-10s %s\n", "TIME_MS", "PID", "XID", "EVENT");
+}
+
+/* 记录查询开始 */
+usdt:/usr/local/pgsql/bin/postgres:query__start {
+    @q_start[pid] = nsecs;
+    printf("%-8d %-10d %-10s SQL: %s\n", elapsed / 1000000, pid, "-", str(arg0));
+}
+
+/* 记录事务ID */
+usdt:/usr/local/pgsql/bin/postgres:transaction__start {
+    @xid_map[pid] = (uint32)arg0;
+}
+
+/* 仅在有对应开始记录时才处理提交 */
+usdt:/usr/local/pgsql/bin/postgres:transaction__commit /@q_start[pid]/ {
+    $duration = (nsecs - @q_start[pid]) / 1000000;
+    $xid = @xid_map[pid];
+    
+    printf("%-8d %-10d %-10d [Commit] Duration: %dms\n", 
+           elapsed / 1000000, pid, $xid, $duration);
+    
+    delete(@q_start[pid]);
+    if (@xid_map[pid]) { delete(@xid_map[pid]); }
+}
+
+/* 清理后台或不完整事务 */
+usdt:/usr/local/pgsql/bin/postgres:transaction__abort {
+    delete(@q_start[pid]);
+    delete(@xid_map[pid]);
+}
+
+END {
+    clear(@q_start);
+    clear(@xid_map);
+}

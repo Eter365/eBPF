@@ -1,0 +1,39 @@
+/* pg_comprehensive.bt - PG 全链路诊断脚本 */
+
+BEGIN {
+    printf("开始监控 PostgreSQL (PID 过滤已关闭)... 按 Ctrl-C 结束\n");
+    printf("%-10s %-18s %-10s %s\n", "TIME_MS", "EVENT", "LATENCY", "DETAILS");
+}
+
+/* 1. 用户态：SQL 执行计时 */
+usdt:/usr/local/pgsql/bin/postgres:query__start {
+    @q_start[pid] = nsecs;
+    @q_sql[pid] = str(arg0);
+}
+
+usdt:/usr/local/pgsql/bin/postgres:query__done /@q_start[pid]/ {
+    $dur = (nsecs - @q_start[pid]) / 1000000;
+    if ($dur > 10) { /* 只记录超过 10ms 的查询 */
+        printf("%-10d %-18s %-10d %s\n", elapsed / 1000000, "SQL_DONE", $dur, @q_sql[pid]);
+    }
+    delete(@q_start[pid]);
+    delete(@q_sql[pid]);
+}
+
+/* 2. 内核态：系统调用耗时直方图 */
+tracepoint:raw_syscalls:sys_enter /comm == "postgres"/ {
+    @sys_start[tid] = nsecs;
+}
+
+tracepoint:raw_syscalls:sys_exit /@sys_start[tid]/ {
+    $sys_dur = (nsecs - @sys_start[tid]) / 1000; /* 微秒 */
+    @syscall_latency_us = hist($sys_dur);
+    delete(@sys_start[tid]);
+}
+
+/* 3. 退出时清理 */
+END {
+    clear(@q_start);
+    clear(@q_sql);
+    clear(@sys_start);
+}

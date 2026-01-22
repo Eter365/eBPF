@@ -1,0 +1,21 @@
+/* pg_syscall_latency.bt */
+
+tracepoint:raw_syscalls:sys_enter /comm == "postgres"/ {
+    @start[tid] = nsecs;
+    @sysname[tid] = args.id;
+}
+
+tracepoint:raw_syscalls:sys_exit /@start[tid]/ {
+    $duration_us = (nsecs - @start[tid]) / 1000;
+    $id = @sysname[tid];
+
+    // 按系统调用 ID 统计耗时直方图（单位：微秒）
+    @latency_us[$id] = hist($duration_us);
+
+    delete(@start[tid]);
+    delete(@sysname[tid]);
+}
+
+END {
+    printf("\n提示：系统调用 ID 对应的名称可通过 'ausyscall --dump' 查看\n");
+}
