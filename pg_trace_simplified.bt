@@ -1,0 +1,55 @@
+#!/usr/bin/bpftrace
+
+/*
+ * 使用方法: sudo bpftrace pg_trace_with_id.bt
+ */
+
+config = { missing_probes = "warn" }
+
+BEGIN {
+    printf("🚀 PG SQL Monitor with SQL_ID (Grouped Mode)...\n");
+    printf("%-10s %-8s %-8s %-10s %s\n", "TIME", "SQL_ID", "PID", "LATENCY", "SQL_TEXT");
+    printf("--------------------------------------------------------------------------------\n");
+}
+
+/* 1. SQL 开始：生成唯一的 SQL_ID */
+usdt:/usr/local/pgsql/bin/postgres:query__start {
+    @total_queries = @total_queries + 1; // 全局自增 ID
+    $sql_id = @total_queries;
+    
+    @q_start[pid] = nsecs;
+    @q_id[pid] = $sql_id;           // 暂存该进程当前的 SQL_ID
+    @q_string[pid] = str(arg0);
+    
+    time("%H:%M:%S  ");
+    printf("%-8d %-8d %-10s %s [START]\n", 
+           $sql_id, pid, "-", @q_string[pid]);
+}
+
+/* 2. SQL 结束：使用相同的 SQL_ID 进行关联 */
+usdt:/usr/local/pgsql/bin/postgres:query__done /@q_start[pid]/ {
+    $lat = (nsecs - @q_start[pid]) / 1000000;
+    $sql_id = @q_id[pid];
+    
+    time("%H:%M:%S  ");
+    printf("%-8d %-8d %-10d ms %s [DONE]\n", 
+           $sql_id, pid, $lat, @q_string[pid]);
+
+    delete(@q_start[pid]);
+    delete(@q_id[pid]);
+    delete(@q_string[pid]);
+}
+
+/* 3. 异常清理 */
+usdt:/usr/local/pgsql/bin/postgres:query__error {
+    delete(@q_start[pid]);
+    delete(@q_id[pid]);
+    delete(@q_string[pid]);
+}
+
+END {
+    clear(@q_start);
+    clear(@q_id);
+    clear(@q_string);
+    clear(@total_queries);
+}

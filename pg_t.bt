@@ -1,0 +1,51 @@
+#!/usr/bin/bpftrace
+
+config = { missing_probes = "warn" }
+
+BEGIN {
+    printf("🚀 PostgreSQL Monitor: SQL Trace + Latency Histogram\n");
+    printf("Tracing... Press Ctrl+C to stop and view the distribution map.\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("%-10s %-12s %-8s %-10s %s\n", "TIME", "REQ_ID", "PID", "LATENCY", "SQL_TEXT");
+}
+
+/* 1. SQL 开始 */
+usdt:/usr/local/pgsql/bin/postgres:query__start {
+    $ts = nsecs;
+    @q_start[pid] = $ts;
+    @q_string[pid] = str(arg0);
+    @q_group_id[pid] = $ts % 1000000; 
+}
+
+/* 2. SQL 结束 */
+usdt:/usr/local/pgsql/bin/postgres:query__done /@q_start[pid]/ {
+    $lat_ms = (nsecs - @q_start[pid]) / 1000000;
+    $gid = @q_group_id[pid];
+
+    // 打印实时流水
+    time("%H:%M:%S  ");
+    printf("%-12u %-8d %-10d ms %s\n", $gid, pid, $lat_ms, @q_string[pid]);
+
+    // 【核心亮点】将耗时存入直方图 Map
+    // lhist(数据, 最小值, 最大值, 步长) -> 这里展示 0-100ms 之间的线性分布
+    @latency_distribution_ms = lhist($lat_ms, 0, 100, 10);
+    
+    // 如果有极慢的 SQL（超过 100ms），记录在对数分布里看全局
+    @latency_overview_ms = hist($lat_ms);
+
+    delete(@q_start[pid]);
+    delete(@q_string[pid]);
+    delete(@q_group_id[pid]);
+}
+
+/* 3. 错误清理 */
+usdt:/usr/local/pgsql/bin/postgres:query__error {
+    delete(@q_start[pid]);
+    delete(@q_string[pid]);
+    delete(@q_group_id[pid]);
+}
+
+END {
+    printf("\n\n📊 SQL Latency Distribution Report (ms):\n");
+    // 退出时自动打印 @latency_distribution_ms 和 @latency_overview_ms
+}

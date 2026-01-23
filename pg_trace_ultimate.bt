@@ -1,0 +1,76 @@
+/* pg_trace_ultimate.bt */
+
+BEGIN {
+    printf("🚀 PostgreSQL Real-time Monitor Started...\n");
+    printf("%-10s %-8s %-10s %-10s %-10s %s\n", 
+           "TIME", "PID", "USER", "DB", "LATENCY", "EVENT/SQL");
+    printf("--------------------------------------------------------------------------------\n");
+}
+
+/* * 1. 捕捉查询起点
+ * arg0: SQL 文本
+ */
+usdt:/usr/local/pgsql/bin/postgres:query__start {
+    @q_start[pid] = nsecs;
+    @q_string[pid] = str(arg0);
+    // 同时也记录进入这个事件的时间戳，用于多阶段分析
+    @last_event_ts[pid] = nsecs;
+}
+
+/* * 2. 捕捉事务 ID
+ * arg0: Transaction ID
+ */
+usdt:/usr/local/pgsql/bin/postgres:transaction__start {
+    @xid_map[pid] = (uint32)arg0;
+}
+
+/* * 3. 捕捉查询结束 (在这里做主要的耗时输出)
+ */
+usdt:/usr/local/pgsql/bin/postgres:query__done /@q_start[pid]/ {
+    $now = nsecs;
+    $duration = ($now - @q_start[pid]) / 1000000; // ms
+    
+    // 如果耗时超过 10ms 才打印，减少屏幕刷新负担
+    if ($duration >= 10) {
+        printf("%-10s %-8d %-10s %-10s %-10d %s\n", 
+               timestr($now), pid, username, "-", $duration, @q_string[pid]);
+    }
+
+    delete(@q_start[pid]);
+    delete(@q_string[pid]);
+    delete(@last_event_ts[pid]);
+}
+
+/* * 4. 捕捉事务提交
+ * 这里可以观察事务从 Query Done 到 Commit 之间的间隙（可能是刷盘延迟）
+ */
+usdt:/usr/local/pgsql/bin/postgres:transaction__commit /@xid_map[pid]/ {
+    $xid = @xid_map[pid];
+    printf("%-10s %-8d %-10s %-10s %-10s [TX_COMMIT] XID: %u\n", 
+           timestr(nsecs), pid, username, "-", "-", $xid);
+    
+    delete(@xid_map[pid]);
+}
+
+/* * 5. 错误处理：死锁、语法错误等导致的异常退出
+ */
+usdt:/usr/local/pgsql/bin/postgres:query__error {
+    printf("%-10s %-8d %-10s %-10s %-10s [ERROR] Query Failed! SQL: %s\n", 
+           timestr(nsecs), pid, username, "-", "-", @q_string[pid]);
+    delete(@q_start[pid]);
+    delete(@q_string[pid]);
+}
+
+/* * 6. 统计：生成耗时直方图 (在退出时展示)
+ */
+usdt:/usr/local/pgsql/bin/postgres:query__done {
+    @latency_dist_ms = hist((nsecs - @q_start[pid]) / 1000000);
+}
+
+END {
+    printf("\n📊 SQL Latency Distribution (ms):\n");
+    clear(@q_start);
+    clear(@q_string);
+    clear(@xid_map);
+    clear(@last_event_ts);
+}
